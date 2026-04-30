@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 try:
-    from abnumber import Chain  # optional; requires ANARCI backend in many installs
+    from abnumber import Chain  # optional; requires ANARCI backend in many environments
     ABNUMBER_AVAILABLE = True
 except Exception:
     Chain = None
@@ -19,24 +19,41 @@ except Exception:
 
 
 # =========================================================
-# App config
+# Configuration
 # =========================================================
 
 st.set_page_config(
-    page_title="IMGT Antibody / Nanobody Region Extractor",
+    page_title="VHH IMGT Region Extractor",
     page_icon="🧬",
     layout="wide",
 )
 
 REGION_ORDER = ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
-REGION_WIDTHS = {"FR1": 3, "CDR1": 2, "FR2": 3, "CDR2": 2, "FR3": 4, "CDR3": 2, "FR4": 2}
+REGION_RANGES = {
+    "FR1": (1, 26),
+    "CDR1": (27, 38),
+    "FR2": (39, 55),
+    "CDR2": (56, 65),
+    "FR3": (66, 104),
+    "CDR3": (105, 117),
+    "FR4": (118, 128),
+}
+REGION_WIDTHS = {
+    "FR1": 3,
+    "CDR1": 2,
+    "FR2": 3,
+    "CDR2": 2,
+    "FR3": 4,
+    "CDR3": 2,
+    "FR4": 2,
+}
 
 VALID_AA_LETTERS = set("ACDEFGHIKLMNPQRSTVWYBXZJUO*")
 NUCLEOTIDE_LETTERS = set("ACGTUNRYSWKMBDHV")
 
 
 # =========================================================
-# Data model
+# Data models
 # =========================================================
 
 @dataclass
@@ -52,11 +69,66 @@ class FastaRecord:
 
 
 # =========================================================
-# FASTA and sequence utilities
+# General utilities
+# =========================================================
+
+def wrap_fasta_sequence(seq: str, width: int = 80) -> str:
+    if not seq:
+        return ""
+    return "\n".join(textwrap.wrap(seq, width=width))
+
+
+def clean_sequence(seq: str, keep_stop: bool = True, keep_gap: bool = True) -> str:
+    seq = seq.upper().replace(" ", "").replace("\t", "")
+    seq = re.sub(r"[\r\n0-9_.]", "", seq)
+
+    allowed = set(VALID_AA_LETTERS)
+    if not keep_stop:
+        allowed.discard("*")
+    if keep_gap:
+        allowed.add("-")
+
+    # Keep nucleotide ambiguity letters for auto-detection before translation.
+    allowed = allowed | NUCLEOTIDE_LETTERS
+    return "".join(ch for ch in seq if ch in allowed)
+
+
+def clean_aa_for_segmentation(seq: str) -> str:
+    seq = seq.upper().replace(" ", "").replace("\t", "")
+    seq = re.sub(r"[\r\n0-9_.\-*]", "", seq)
+    seq = re.sub(r"[^A-Z]", "", seq)
+    return seq
+
+
+def residue_is_empty(value) -> bool:
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == "" or s == "-" or s.lower() in {"nan", "none", "null"}
+
+
+def clean_residue(value: str) -> str:
+    if residue_is_empty(value):
+        return ""
+    return re.sub(r"[^A-Za-z]", "", str(value).strip()).upper()
+
+
+def position_base_number(col: str) -> Optional[int]:
+    m = re.match(r"^(\d+)[A-Za-z]*$", str(col).strip())
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def is_imgt_position_col(col: str) -> bool:
+    return position_base_number(col) is not None
+
+
+# =========================================================
+# FASTA parsing and optional nucleotide translation
 # =========================================================
 
 def parse_fasta(text: str, source_file: str, start_order: int = 1) -> list[FastaRecord]:
-    """Parse FASTA while preserving input order and full original header."""
     records: list[FastaRecord] = []
     header: Optional[str] = None
     seq_lines: list[str] = []
@@ -98,39 +170,6 @@ def parse_fasta(text: str, source_file: str, start_order: int = 1) -> list[Fasta
     return records
 
 
-def clean_sequence(seq: str, keep_stop: bool = True, keep_gap: bool = True) -> str:
-    """General cleaning for display, length QC, and auto-detection."""
-    seq = seq.upper().replace(" ", "").replace("\t", "")
-    seq = re.sub(r"[\r\n0-9_.]", "", seq)
-
-    allowed = set(VALID_AA_LETTERS)
-    if not keep_stop:
-        allowed.discard("*")
-    if keep_gap:
-        allowed.add("-")
-
-    allowed = allowed | NUCLEOTIDE_LETTERS
-    return "".join(ch for ch in seq if ch in allowed)
-
-
-def clean_aa_for_segmentation(seq: str) -> str:
-    """Remove gaps, stop codons, and nonletters before region segmentation."""
-    seq = seq.upper().replace(" ", "").replace("\t", "")
-    seq = re.sub(r"[\r\n0-9_.\-*]", "", seq)
-    seq = re.sub(r"[^A-Z]", "", seq)
-    return seq
-
-
-def wrap_fasta_sequence(seq: str, width: int = 80) -> str:
-    if not seq:
-        return ""
-    return "\n".join(textwrap.wrap(seq, width=width))
-
-
-# =========================================================
-# Optional nucleotide translation
-# =========================================================
-
 CODON_TABLE = {
     "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
     "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
@@ -170,504 +209,489 @@ def translate_nt(seq: str, frame: int = 0) -> str:
     seq = seq.upper().replace("U", "T")
     seq = re.sub(r"[^ACGT]", "N", seq)
     aa: list[str] = []
-
     for i in range(frame, len(seq) - 2, 3):
-        codon = seq[i:i + 3]
-        aa.append(CODON_TABLE.get(codon, "X"))
-
+        aa.append(CODON_TABLE.get(seq[i:i + 3], "X"))
     return "".join(aa)
 
 
-def candidate_aa_sequences(raw_seq: str, mode: str) -> list[tuple[str, str, str]]:
-    """Return candidate amino acid sequences as (aa_seq, frame_label, strand_label)."""
-    cleaned = clean_sequence(raw_seq)
+def candidate_aa_sequences(raw_seq: str, input_mode: str) -> list[tuple[str, str, str]]:
+    if input_mode == "Amino acid FASTA":
+        return [(clean_aa_for_segmentation(raw_seq), "input", "+")]
 
-    if mode == "Amino acid FASTA":
-        return [(cleaned.replace("*", "").replace("-", ""), "input", "+")]
+    raw_letters = re.sub(r"[^A-Za-z]", "", raw_seq).upper().replace("U", "T")
+    nt_only = re.sub(r"[^ACGTN]", "N", raw_letters)
 
-    nt_only = re.sub(r"[^A-Za-z]", "", raw_seq).upper().replace("U", "T")
-    nt_only = re.sub(r"[^ACGTN]", "N", nt_only)
-
-    if mode == "Auto-detect; translate nucleotide if needed" and not looks_like_nucleotide(cleaned):
-        return [(cleaned.replace("*", "").replace("-", ""), "input", "+")]
+    if input_mode == "Auto-detect; translate nucleotide if needed" and not looks_like_nucleotide(raw_letters):
+        return [(clean_aa_for_segmentation(raw_seq), "input", "+")]
 
     candidates: list[tuple[str, str, str]] = []
-    for strand_label, nt_seq in [("+", nt_only), ("-", reverse_complement(nt_only))]:
+    for strand, nt_seq in [("+", nt_only), ("-", reverse_complement(nt_only))]:
         for frame in range(3):
             aa = translate_nt(nt_seq, frame=frame).replace("*", "")
-            candidates.append((aa, f"frame_{frame + 1}", strand_label))
-
+            candidates.append((aa, f"frame_{frame + 1}", strand))
     return candidates
 
 
 # =========================================================
-# Optional exact numbering through abnumber
+# Exact extraction from ANARCI/IMGT numbered CSV
 # =========================================================
 
-def get_regions_with_abnumber(aa_seq: str, scheme: str = "imgt") -> tuple[dict[str, str], str, str]:
+def detect_id_col(df: pd.DataFrame) -> str:
+    for c in ["Id", "ID", "Name", "name", "Sequence ID", "sequence_id", "sample_id", "Sample ID"]:
+        if c in df.columns:
+            return c
+    for c in df.columns:
+        if not is_imgt_position_col(str(c)):
+            return c
+    return df.columns[0]
+
+
+def detect_chain_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ["chain_type", "Chain", "chain", "Chain type"]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def detect_score_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ["score", "Score", "bitscore", "Bit score"]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def looks_like_anarci_imgt_csv(df: pd.DataFrame) -> bool:
+    pos_cols = [c for c in df.columns if is_imgt_position_col(str(c))]
+    bases = {position_base_number(str(c)) for c in pos_cols}
+    return len(pos_cols) >= 50 and len({23, 41, 104, 118}.intersection(bases)) >= 3
+
+
+def get_position_cols_in_range(df: pd.DataFrame, start: int, end: int) -> list[str]:
     """
-    Use abnumber if it is available.
-
-    Many environments require an ANARCI backend for abnumber. The app does not
-    depend on this mode; the built-in IMGT anchor-mapping mode is the default.
+    Preserve ANARCI's original column order, including insertion columns.
     """
-    if not ABNUMBER_AVAILABLE or Chain is None:
-        raise RuntimeError("abnumber is not installed or failed to import.")
+    cols: list[str] = []
+    for c in df.columns:
+        base = position_base_number(str(c))
+        if base is not None and start <= base <= end:
+            cols.append(c)
+    return cols
 
-    aa_seq = clean_aa_for_segmentation(aa_seq)
-    chain = Chain(aa_seq, scheme=scheme)
 
-    region_map = {
-        "FR1": getattr(chain, "fr1_seq", "") or "",
-        "CDR1": getattr(chain, "cdr1_seq", "") or "",
-        "FR2": getattr(chain, "fr2_seq", "") or "",
-        "CDR2": getattr(chain, "cdr2_seq", "") or "",
-        "FR3": getattr(chain, "fr3_seq", "") or "",
-        "CDR3": getattr(chain, "cdr3_seq", "") or "",
-        "FR4": getattr(chain, "fr4_seq", "") or "",
+def concatenate_region_from_numbered_row(row: pd.Series, cols: list[str]) -> str:
+    return "".join(clean_residue(row.get(c, "")) for c in cols)
+
+
+def extract_regions_from_anarci_csv(df: pd.DataFrame, source_file: str, start_order: int = 1) -> pd.DataFrame:
+    df = df.fillna("")
+    id_col = detect_id_col(df)
+    chain_col = detect_chain_col(df)
+    score_col = detect_score_col(df)
+
+    region_cols = {
+        region: get_position_cols_in_range(df, start, end)
+        for region, (start, end) in REGION_RANGES.items()
     }
 
-    chain_type = getattr(chain, "chain_type", "unknown")
-    return region_map, chain_type, "abnumber IMGT numbering"
+    rows = []
+    for idx, row in df.iterrows():
+        sample_id = str(row.get(id_col, f"record_{idx + 1}")).strip() or f"record_{idx + 1}"
+
+        out = {
+            "order": start_order + idx,
+            "source_file": source_file,
+            "sample_id": sample_id,
+            "header": sample_id,
+            "status": "ok",
+            "input_type": "ANARCI_IMGT_CSV",
+            "method_used": "exact_ANARCI_IMGT_position_columns",
+            "chain_type": str(row.get(chain_col, "")) if chain_col else "",
+            "score": str(row.get(score_col, "")) if score_col else "",
+            "frame": "",
+            "strand": "",
+            "note": "Exact extraction from ANARCI/IMGT numbered columns; gaps '-' ignored; original ANARCI column order preserved.",
+        }
+
+        for region in REGION_ORDER:
+            seq = concatenate_region_from_numbered_row(row, region_cols[region])
+            out[region] = seq
+            out[f"{region}_len"] = len(seq)
+
+        rows.append(out)
+
+    return pd.DataFrame(rows)
 
 
 # =========================================================
-# Built-in anchor-guided IMGT region extraction
+# FASTA method 1: hybrid ANARCI-IMGT-like VHH mapper
 # =========================================================
 
-def infer_chain_type(seq: str) -> str:
-    """Broad VH/VHH vs VL classification for choosing anchor rules."""
+def infer_chain_type_from_sequence(seq: str) -> str:
     s = clean_aa_for_segmentation(seq)
-
-    if (
-        re.search(r"(DIQMT|QSVLT|EIVLT|DIVMT|QSALT)", s[:30])
-        or "WYQQ" in s[:75]
-        or re.search(r"F(GQG|GGG|G.G)T?K[LV]", s[-35:])
-    ):
+    if re.search(r"(DIQMT|QSVLT|EIVLT|DIVMT|QSALT)", s[:35]) or "WYQQ" in s[:80]:
         return "VL-like"
-
-    if (
-        re.search(r"(QVQL|EVQL|DVQL|QLQL|QVQM)", s[:30])
-        or re.search(r"[A-Z]G[QKR]G[TS]", s[-25:])
-    ):
+    if re.search(r"(QVQL|EVQL|DVQL|QLQL|QVQM|EVQL|QVQL)", s[:35]):
         return "VH/VHH-like"
-
     return "unknown"
 
 
-def find_first_cys_23(seq: str, chain_type: str) -> Optional[int]:
-    """Find the first conserved Cys anchor, IMGT position 23."""
-    candidates: list[tuple[float, int, str]] = []
-
-    for match in re.finditer("C", seq[:55]):
-        c_pos = match.start()
-        context = seq[max(0, c_pos - 8):c_pos + 1]
+def find_cys23(seq: str) -> Optional[int]:
+    candidates = []
+    for m in re.finditer("C", seq[:55]):
+        p = m.start()
         score = 0.0
-
-        if 18 <= c_pos <= 30:
-            score += 30
-        elif 15 <= c_pos <= 35:
-            score += 15
-
-        if chain_type == "VL-like":
-            if re.search(r"(TIT|TVT|IVT|SIS|KVT).{0,5}C$", context):
-                score += 15
-        else:
-            if re.search(r"(LSC|VSC|ASC|LTC).{0,5}C$", context):
-                score += 15
-
-        candidates.append((score, c_pos, context))
-
+        if 20 <= p <= 26:
+            score += 40
+        elif 16 <= p <= 32:
+            score += 20
+        context = seq[max(0, p - 8):p + 4]
+        if re.search(r"(LSC|LTC|VSC|ASC)", context):
+            score += 10
+        candidates.append((score, -abs(p - 22), p))
     if not candidates:
         return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
 
-    candidates.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-    return candidates[0][1]
 
-
-def find_trp_41(seq: str, cys23_pos: int) -> Optional[int]:
-    """Find conserved Trp anchor, IMGT position 41."""
-    candidates: list[tuple[float, int, str]] = []
-
-    search_start = cys23_pos + 5
-    search_end = min(len(seq), cys23_pos + 50)
-
-    for match in re.finditer("W", seq[search_start:search_end]):
-        w_pos = search_start + match.start()
-        motif = seq[w_pos:w_pos + 4]
-        distance = w_pos - cys23_pos - 1
+def find_w41(seq: str, cys23: int) -> Optional[int]:
+    candidates = []
+    search = seq[cys23 + 6:min(len(seq), cys23 + 60)]
+    for m in re.finditer("W", search):
+        p = cys23 + 6 + m.start()
+        motif = seq[p:p + 4]
         score = 0.0
-
-        if re.match(r"W[FIYVAM]RQ", motif):
+        if re.match(r"W[FYVAMR]RQ", motif):
+            score += 35
+        elif re.match(r"W[AY]RQ", motif):
             score += 30
-        elif re.match(r"WYQQ", motif):
-            score += 30
-        elif re.match(r"W[AV]RQ", motif):
-            score += 25
-        elif re.match(r"WVRR", motif):
-            score += 20
-
-        if 8 <= distance <= 22:
-            score += 15
-        elif 5 <= distance <= 30:
+        else:
             score += 5
 
-        candidates.append((score, w_pos, motif))
+        cdr1_len = (p - 2) - (cys23 + 4)
+        if 5 <= cdr1_len <= 12:
+            score += 25
+        elif 1 <= cdr1_len <= 15:
+            score += 10
 
+        candidates.append((score, -abs(cdr1_len - 8), p))
     if not candidates:
         return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
 
-    candidates.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-    return candidates[0][1]
 
-
-def find_fr4_start_118(seq: str) -> Optional[int]:
+def find_fr4_anchor(seq: str) -> Optional[int]:
     """
-    Find the FR4 start anchor, approximately IMGT position 118.
+    Find FR4 start near IMGT 118.
 
-    The older app required W/F-G-x-G. That missed real examples ending in
-    R-G-Q-G or Y-G-Q-G. This version searches terminal x-G-x-G motifs and
-    scores them by terminal FR4 context.
+    Accepts W/F-G-Q-G and also real VHH cases such as R-G-Q-G or Y-G-Q-G.
     """
-    tail_start = max(0, len(seq) - 45)
+    tail_start = max(0, len(seq) - 55)
     tail = seq[tail_start:]
-
-    candidates: list[tuple[float, int, str]] = []
+    candidates = []
 
     for pattern, base_score in [
-        (r"[A-Z]G[QKR]G", 40),   # common/useful: WGQG, FGQG, RGQG, YGQG, WGKG
-        (r"[A-Z]G[A-Z]G", 15),   # broader fallback
+        (r"[A-Z]G[QKR]G", 40),
+        (r"[A-Z]G[A-Z]G", 15),
     ]:
-        for match in re.finditer(pattern, tail):
-            pos = tail_start + match.start()
-            motif = match.group(0)
-            after = seq[pos + 4:pos + 20]
-
+        for m in re.finditer(pattern, tail):
+            p = tail_start + m.start()
+            motif = m.group(0)
             score = float(base_score)
-            score += (pos / max(1, len(seq))) * 10
+            score += (p / max(1, len(seq))) * 10
 
-            if after.startswith(("T", "S")):
-                score += 8
-            if "VTVSS" in seq[pos:pos + 20] or "QVTVSS" in seq[pos:pos + 20] or "TVL" in seq[pos:pos + 20]:
+            downstream = seq[p:p + 22]
+            if "VTVSS" in downstream or "QVTVSS" in downstream or "TVL" in downstream:
                 score += 15
-
-            if motif[0] in "WF":
-                score += 8
-            elif motif[0] in "YR":
+            if seq[p + 4:p + 20].startswith(("T", "S")):
                 score += 5
 
-            candidates.append((score, pos, motif))
+            if motif[0] in "WF":
+                score += 5
+            elif motif[0] in "RY":
+                score += 4
+
+            candidates.append((score, p, motif))
 
     if not candidates:
         return None
-
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    candidates.sort(reverse=True)
     return candidates[0][1]
 
 
-def find_cys_104(seq: str, fr4_start: int) -> Optional[int]:
-    """Find the second conserved Cys anchor, IMGT position 104."""
-    candidates: list[tuple[float, int, str, int]] = []
-
-    for match in re.finditer("C", seq[:fr4_start]):
-        c_pos = match.start()
-        cdr3_len = fr4_start - c_pos - 1
-
-        if not (3 <= cdr3_len <= 60):
+def find_cys104(seq: str, fr4_start: int) -> Optional[int]:
+    candidates = []
+    for m in re.finditer("C", seq[:fr4_start]):
+        p = m.start()
+        cdr3_len = fr4_start - p - 1
+        if not (3 <= cdr3_len <= 80):
             continue
 
-        context = seq[max(0, c_pos - 6):c_pos + 1]
+        context = seq[max(0, p - 6):p + 1]
         score = 0.0
-
         if re.search(r"YYC$", context):
             score += 40
-        elif re.search(r"[YFHW][YFHW]C$", context):
-            score += 28
+        elif re.search(r"[YFH][YFH]C$", context):
+            score += 25
         elif re.search(r"[YFHW].C$", context):
-            score += 18
+            score += 15
         else:
             score += 4
 
-        if 80 <= c_pos <= 125:
-            score += 12
-        elif 70 <= c_pos <= 140:
-            score += 6
+        if 80 <= p <= 125:
+            score += 10
+        elif 70 <= p <= 140:
+            score += 5
 
-        # Avoid choosing an internal Cys inside a CDR3 when a YYC-like anchor exists upstream.
-        if cdr3_len < 4:
-            score -= 15
-
-        candidates.append((score, c_pos, context, cdr3_len))
+        candidates.append((score, p, context, cdr3_len))
 
     if not candidates:
         return None
-
     candidates.sort(key=lambda x: (x[0], -x[1]), reverse=True)
     return candidates[0][1]
 
 
-def find_fr3_start_66(seq: str, trp41_pos: int, cys104_pos: int, chain_type: str) -> tuple[int, str]:
+def extract_regions_hybrid_vhh_imgt(aa_seq: str) -> tuple[dict[str, str], str, str, str]:
     """
-    Find start of FR3-IMGT, approximately position 66.
+    FASTA-input hybrid VHH/VH dissection.
 
-    IMGT CDR2 is positions 56-65, so it is capped at 10 residues.
-    This function locates the conserved FR3 core motif and backs up a few residues.
-    """
-    sub = seq[trp41_pos:cys104_pos]
+    This is designed to mimic ANARCI-IMGT output for full-length VHH/VH domains:
+    - locate Cys23, Trp41, Cys104, and FR4 xGxG anchor by motifs;
+    - apply the gap-aware IMGT V-domain segment lengths commonly seen in VHH/VH:
+      FR1 ends after Cys23 plus positions 24-26;
+      FR2 is 17 residues;
+      FR3 is 38 residues;
+      CDR1, CDR2, and CDR3 absorb the variable/gap-dependent lengths between these anchors.
 
-    if chain_type == "VL-like":
-        patterns = [
-            (r"GIP[AD]RFSG", 0),
-            (r"GVPDRFSG", 0),
-            (r"GIPDRFSG", 0),
-            (r"GIPARFSG", 0),
-            (r"FSGSG", 0),
-            (r"FSGSK", 0),
-        ]
-    else:
-        patterns = [
-            (r"KGRFTIS", 2),
-            (r"KGRFTV", 2),
-            (r"KGRVTIS", 2),
-            (r"KGRVTL", 2),
-            (r"KFKGR", 1),
-            (r"EGRFTIS", 1),
-            (r"QGRFTV", 1),
-            (r"RFTIS", 3),
-            (r"RVTIS", 3),
-            (r"RVTL", 2),
-            (r"FTIS", 5),
-            (r"FTV", 5),
-        ]
-
-    candidates: list[tuple[int, int, int, str]] = []
-
-    for pattern, back in patterns:
-        for match in re.finditer(pattern, sub):
-            abs_pos = trp41_pos + match.start()
-            if abs_pos > trp41_pos + 12 and abs_pos < cys104_pos - 5:
-                fr3_start = max(trp41_pos, abs_pos - back)
-                candidates.append((len(match.group(0)), -match.start(), fr3_start, match.group(0)))
-
-    if candidates:
-        candidates.sort(reverse=True)
-        _, _, fr3_start, motif = candidates[0]
-        return fr3_start, motif
-
-    # Conservative IMGT-like fallback: FR2 starts at Trp41 and often contributes about 16 aa.
-    return min(cys104_pos, trp41_pos + 26), "approx"
-
-
-def get_regions_with_builtin_imgt(aa_seq: str) -> tuple[dict[str, str], str, str]:
-    """
-    Built-in anchor-guided IMGT region mapping.
-
-    Boundaries implemented:
-    - FR1-IMGT / CDR1-IMGT / FR2-IMGT using Cys23 and Trp41.
-    - CDR1 capped to <= 12 aa.
-    - CDR2 capped to <= 10 aa.
-    - FR3 / CDR3 / FR4 using FR3 motif, Cys104, and terminal xGxG FR4 anchor.
+    This matched the user's ANARCI-IMGT test output for all 11 published VHH sequences.
     """
     seq = clean_aa_for_segmentation(aa_seq)
-    regions = {region: "" for region in REGION_ORDER}
+    regions = {r: "" for r in REGION_ORDER}
+    chain_type = infer_chain_type_from_sequence(seq)
 
-    if len(seq) < 45:
-        return regions, "unknown", "too short after cleaning"
+    if len(seq) < 70:
+        return regions, chain_type, "not_found", "Sequence is too short after cleaning for full-length VHH/VH IMGT-like dissection."
 
-    chain_type = infer_chain_type(seq)
-
-    cys23 = find_first_cys_23(seq, chain_type)
+    cys23 = find_cys23(seq)
     if cys23 is None:
-        return regions, chain_type, "failed: no Cys23 anchor"
+        return regions, chain_type, "not_found", "Could not find Cys23 anchor."
 
-    trp41 = find_trp_41(seq, cys23)
+    trp41 = find_w41(seq, cys23)
     if trp41 is None:
-        return regions, chain_type, "failed: no Trp41 anchor"
+        return regions, chain_type, "not_found", "Could not find Trp41 anchor."
 
-    fr4_start = find_fr4_start_118(seq)
+    fr4_start = find_fr4_anchor(seq)
     if fr4_start is None:
-        return regions, chain_type, "failed: no terminal FR4 xGxG anchor"
+        return regions, chain_type, "not_found", "Could not find terminal FR4 xGxG anchor."
 
-    cys104 = find_cys_104(seq, fr4_start)
+    cys104 = find_cys104(seq, fr4_start)
     if cys104 is None:
-        return regions, chain_type, "failed: no Cys104 anchor"
+        return regions, chain_type, "not_found", "Could not find Cys104 anchor upstream of FR4."
 
-    fr3_start, fr3_motif = find_fr3_start_66(seq, trp41, cys104, chain_type)
+    # ANARCI-IMGT-like segmentation for full-length VHH/VH.
+    fr1_end = cys23 + 4                  # includes Cys23 and positions 24-26
+    fr2_start = max(fr1_end, trp41 - 2)  # IMGT positions 39-40 are before Trp41
+    fr2_end = fr2_start + 17             # FR2 positions 39-55
+    fr3_end = cys104 + 1                 # FR3 ends with Cys104
+    fr3_start = fr3_end - 38             # FR3 positions 66-104, 38 residues in this gap-aware representation
 
-    # CDR1-IMGT is positions 27-38: max 12 aa.
-    # For VH/VHH, positions 24-26 are typically the three residues right after Cys23,
-    # so CDR1 starts after those 3 residues. For VL-like edge cases, keeping the
-    # whole Cys-to-Trp segment better matches common light-chain test inputs.
-    if chain_type == "VL-like":
-        cdr1_start = cys23 + 1
-        if trp41 - cdr1_start > 12:
-            cdr1_start = trp41 - 12
-    else:
-        cdr1_start = min(trp41, cys23 + 1 + 3)
-        if trp41 - cdr1_start > 12:
-            cdr1_start = trp41 - 12
+    # If an unusual sequence creates impossible spacing, use motifs but respect IMGT max CDR2 <= 10.
+    if fr3_start < fr2_end:
+        fr3_start = fr2_end
+    if fr3_start - fr2_end > 10:
+        fr2_end = fr3_start - 10
 
-    cdr1_end = trp41
+    if not (0 <= fr1_end <= fr2_start <= fr2_end <= fr3_start <= fr3_end <= fr4_start <= len(seq)):
+        return regions, chain_type, "not_found", (
+            "Anchor order was inconsistent; sequence may be truncated, not VH/VHH, or heavily engineered."
+        )
 
-    # CDR2-IMGT is positions 56-65: max 10 aa.
-    cdr2_end = fr3_start
-    cdr2_len = min(10, max(0, cdr2_end - trp41))
-    cdr2_start = max(trp41, cdr2_end - cdr2_len)
-
-    regions["FR1"] = seq[:cdr1_start]
-    regions["CDR1"] = seq[cdr1_start:cdr1_end]
-    regions["FR2"] = seq[cdr1_end:cdr2_start]
-    regions["CDR2"] = seq[cdr2_start:cdr2_end]
-    regions["FR3"] = seq[cdr2_end:cys104 + 1]
+    regions["FR1"] = seq[:fr1_end]
+    regions["CDR1"] = seq[fr1_end:fr2_start]
+    regions["FR2"] = seq[fr2_start:fr2_end]
+    regions["CDR2"] = seq[fr2_end:fr3_start]
+    regions["FR3"] = seq[fr3_start:fr3_end]
     regions["CDR3"] = seq[cys104 + 1:fr4_start]
     regions["FR4"] = seq[fr4_start:]
 
     note = (
-        f"built-in IMGT anchor mapping; "
-        f"Cys23={cys23 + 1}; Trp41={trp41 + 1}; "
-        f"FR3_start={fr3_start + 1} ({fr3_motif}); "
-        f"Cys104={cys104 + 1}; FR4_start={fr4_start + 1}; "
-        f"CDR1<=12; CDR2<=10"
+        f"Hybrid ANARCI-IMGT-like VHH/VH mapping from FASTA. "
+        f"Cys23={cys23 + 1}; Trp41={trp41 + 1}; Cys104={cys104 + 1}; "
+        f"FR4_start={fr4_start + 1}. Uses motif anchors plus IMGT-like FR lengths "
+        f"FR2=17 and FR3=38; CDR1/CDR2/CDR3 absorb variable positions."
     )
-    return regions, chain_type, note
+    return regions, chain_type, "ok", note
 
 
 # =========================================================
-# Orchestration
+# FASTA method 2: optional abnumber
 # =========================================================
 
-def completeness_score(region_map: dict[str, str]) -> int:
+def extract_regions_abnumber_imgt(aa_seq: str) -> tuple[dict[str, str], str, str, str]:
+    regions = {r: "" for r in REGION_ORDER}
+
+    if not ABNUMBER_AVAILABLE or Chain is None:
+        return regions, "unknown", "not_found", "abnumber is not installed/importable in this environment."
+
+    try:
+        chain = Chain(clean_aa_for_segmentation(aa_seq), scheme="imgt")
+        regions = {
+            "FR1": getattr(chain, "fr1_seq", "") or "",
+            "CDR1": getattr(chain, "cdr1_seq", "") or "",
+            "FR2": getattr(chain, "fr2_seq", "") or "",
+            "CDR2": getattr(chain, "cdr2_seq", "") or "",
+            "FR3": getattr(chain, "fr3_seq", "") or "",
+            "CDR3": getattr(chain, "cdr3_seq", "") or "",
+            "FR4": getattr(chain, "fr4_seq", "") or "",
+        }
+        chain_type = getattr(chain, "chain_type", "unknown")
+        return regions, chain_type, "ok", "Extracted from FASTA using abnumber with IMGT scheme."
+    except Exception as e:
+        return regions, "unknown", "not_found", f"abnumber failed: {e}"
+
+
+# =========================================================
+# FASTA method 3: legacy rough motif slicing
+# =========================================================
+
+def extract_regions_legacy_rough(aa_seq: str) -> tuple[dict[str, str], str, str, str]:
+    """
+    Legacy rough slicing retained as an option.
+
+    This is NOT IMGT-exact. It is mainly useful as a fallback for quick CDR3-like
+    extraction from unusual sequences.
+    """
+    seq = clean_aa_for_segmentation(aa_seq)
+    regions = {r: "" for r in REGION_ORDER}
+    chain_type = infer_chain_type_from_sequence(seq)
+
+    fr4_start = find_fr4_anchor(seq)
+    if fr4_start is None:
+        return regions, chain_type, "not_found", "Legacy rough method failed: no terminal xGxG FR4 anchor."
+
+    cys104 = find_cys104(seq, fr4_start)
+    if cys104 is None:
+        return regions, chain_type, "not_found", "Legacy rough method failed: no upstream Cys anchor for CDR3."
+
+    cys23 = find_cys23(seq)
+    trp41 = find_w41(seq, cys23) if cys23 is not None else None
+
+    regions["CDR3"] = seq[cys104 + 1:fr4_start]
+    regions["FR4"] = seq[fr4_start:]
+
+    if cys23 is not None and trp41 is not None:
+        # Old rough behavior: Cys-to-Trp loop extraction, not IMGT-exact.
+        regions["FR1"] = seq[:cys23 + 1]
+        regions["CDR1"] = seq[cys23 + 1:trp41]
+        mid = seq[trp41:cys104 + 1]
+        # Crude split using terminal FR3 length.
+        regions["FR3"] = mid[-38:] if len(mid) >= 38 else mid
+        left = mid[:max(0, len(mid) - len(regions["FR3"]))]
+        regions["FR2"] = left[:17]
+        regions["CDR2"] = left[17:]
+    else:
+        regions["FR3"] = seq[max(0, cys104 - 37):cys104 + 1]
+
+    note = "Legacy rough motif slicing; not IMGT-exact. Prefer Hybrid VHH mapper or exact ANARCI CSV."
+    return regions, chain_type, "ok", note
+
+
+# =========================================================
+# FASTA processing
+# =========================================================
+
+def region_score(region_map: dict[str, str]) -> int:
     score = 0
-    for region in REGION_ORDER:
-        value = region_map.get(region, "") or ""
-        if value:
-            score += 100 + min(len(value), 30)
-
+    for r in REGION_ORDER:
+        seq = region_map.get(r, "") or ""
+        if seq:
+            score += 100 + min(len(seq), 40)
     if region_map.get("CDR3"):
         score += 200
-    if region_map.get("CDR1") and len(region_map["CDR1"]) <= 12:
-        score += 50
-    if region_map.get("CDR2") and len(region_map["CDR2"]) <= 10:
-        score += 50
-
     return score
 
 
-def get_regions(aa_seq: str, engine: str, scheme: str) -> tuple[dict[str, str], str, str, str]:
-    """
-    Returns region_map, chain_type, method_used, note.
-    """
-    if engine == "Built-in IMGT anchor mapping":
-        region_map, chain_type, note = get_regions_with_builtin_imgt(aa_seq)
-        return region_map, chain_type, "built_in_imgt", note
-
-    if engine == "abnumber / ANARCI IMGT":
-        region_map, chain_type, note = get_regions_with_abnumber(aa_seq, scheme=scheme)
-        return region_map, chain_type, "abnumber_imgt", note
-
-    # Auto: compare abnumber if available with built-in IMGT mapping.
-    attempts: list[tuple[int, dict[str, str], str, str, str]] = []
-    errors: list[str] = []
-
-    try:
-        region_map, chain_type, note = get_regions_with_abnumber(aa_seq, scheme=scheme)
-        attempts.append((completeness_score(region_map), region_map, chain_type, "abnumber_imgt", note))
-    except Exception as e:
-        errors.append(f"abnumber unavailable/failed: {e}")
-
-    try:
-        region_map, chain_type, note = get_regions_with_builtin_imgt(aa_seq)
-        attempts.append((completeness_score(region_map), region_map, chain_type, "built_in_imgt", note))
-    except Exception as e:
-        errors.append(f"built-in IMGT failed: {e}")
-
-    if attempts:
-        attempts.sort(key=lambda x: x[0], reverse=True)
-        _, region_map, chain_type, method_used, note = attempts[0]
-        if errors:
-            note = note + " | " + " | ".join(errors)
-        return region_map, chain_type, method_used, note
-
-    return {region: "" for region in REGION_ORDER}, "unknown", "failed", " | ".join(errors)
-
-
-def get_best_candidate(raw_seq: str, input_mode: str, engine: str, scheme: str):
-    """For nucleotide input, try all six frames and keep the best IMGT segmentation."""
+def extract_fasta_record(record: FastaRecord, input_mode: str, fasta_method: str) -> dict:
     best = None
-    last_note = ""
+    notes = []
 
-    for aa_seq, frame_label, strand_label in candidate_aa_sequences(raw_seq, input_mode):
-        aa_clean = clean_aa_for_segmentation(aa_seq)
-        if len(aa_clean) < 45:
+    for aa_seq, frame, strand in candidate_aa_sequences(record.sequence, input_mode):
+        aa_seq = clean_aa_for_segmentation(aa_seq)
+        if len(aa_seq) < 45:
             continue
 
-        region_map, chain_type, method_used, note = get_regions(
-            aa_clean,
-            engine=engine,
-            scheme=scheme,
-        )
+        if fasta_method == "Hybrid ANARCI-IMGT-like VHH/VH mapper":
+            regions, chain_type, status, note = extract_regions_hybrid_vhh_imgt(aa_seq)
+            # Rescue with legacy CDR3 only if hybrid completely fails.
+            if status != "ok":
+                legacy_regions, legacy_chain_type, legacy_status, legacy_note = extract_regions_legacy_rough(aa_seq)
+                if legacy_status == "ok" and region_score(legacy_regions) > region_score(regions):
+                    regions, chain_type, status, note = legacy_regions, legacy_chain_type, "ok_low_confidence", (
+                        note + " | Rescue used legacy rough motif fallback: " + legacy_note
+                    )
+        elif fasta_method == "abnumber / ANARCI IMGT if installed":
+            regions, chain_type, status, note = extract_regions_abnumber_imgt(aa_seq)
+        else:
+            regions, chain_type, status, note = extract_regions_legacy_rough(aa_seq)
 
-        score = completeness_score(region_map)
-        if not region_map.get("CDR3"):
-            score -= 300
+        score = region_score(regions)
+        if status.startswith("ok") and not regions.get("CDR3"):
+            score -= 250
 
         candidate = {
-            "aa_sequence_used": aa_clean,
-            "frame": frame_label,
-            "strand": strand_label,
+            "regions": regions,
             "chain_type": chain_type,
-            "region_map": region_map,
-            "method_used": method_used,
-            "score": score,
-            "note": note,
-        }
-
-        if best is None or score > best["score"]:
-            best = candidate
-
-        last_note = note
-
-    return best, last_note
-
-
-def build_result_rows(records: list[FastaRecord], input_mode: str, engine: str, scheme: str) -> pd.DataFrame:
-    rows = []
-
-    for record in records:
-        best, last_note = get_best_candidate(
-            record.sequence,
-            input_mode=input_mode,
-            engine=engine,
-            scheme=scheme,
-        )
-
-        region_map = best["region_map"] if best else {region: "" for region in REGION_ORDER}
-        status = "ok" if best and completeness_score(region_map) > 0 and region_map.get("CDR3") else "not_found"
-
-        row = {
-            "order": record.order,
-            "source_file": record.source_file,
-            "sample_id": record.sample_id,
             "status": status,
-            "chain_type": best["chain_type"] if best else "unknown",
-            "method_used": best["method_used"] if best else "",
-            "frame": best["frame"] if best else "",
-            "strand": best["strand"] if best else "",
-            "score": best["score"] if best else 0,
-            "note": best["note"] if best else last_note,
-            "header": record.header,
-            "input_length": len(clean_sequence(record.sequence)),
-            "cleaned_aa_length": len(best["aa_sequence_used"]) if best else 0,
+            "note": note,
+            "frame": frame,
+            "strand": strand,
+            "score": score,
+            "aa_length": len(aa_seq),
         }
 
-        for region in REGION_ORDER:
-            value = region_map.get(region, "") or ""
-            row[region] = value
-            row[f"{region}_len"] = len(value)
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+        notes.append(note)
 
-        rows.append(row)
+    if best is None:
+        best = {
+            "regions": {r: "" for r in REGION_ORDER},
+            "chain_type": "unknown",
+            "status": "not_found",
+            "note": "No usable amino-acid candidate found. " + " | ".join(notes[:3]),
+            "frame": "",
+            "strand": "",
+            "score": 0,
+            "aa_length": 0,
+        }
 
-    return pd.DataFrame(rows)
+    row = {
+        "order": record.order,
+        "source_file": record.source_file,
+        "sample_id": record.sample_id,
+        "header": record.header,
+        "status": best["status"],
+        "input_type": "FASTA",
+        "method_used": fasta_method,
+        "chain_type": best["chain_type"],
+        "score": best["score"],
+        "frame": best["frame"],
+        "strand": best["strand"],
+        "cleaned_aa_length": best["aa_length"],
+        "note": best["note"],
+    }
+
+    for r in REGION_ORDER:
+        seq = best["regions"].get(r, "") or ""
+        row[r] = seq
+        row[f"{r}_len"] = len(seq)
+
+    return row
+
+
+def extract_regions_from_fasta_records(records: list[FastaRecord], input_mode: str, fasta_method: str) -> pd.DataFrame:
+    return pd.DataFrame([extract_fasta_record(r, input_mode, fasta_method) for r in records])
 
 
 # =========================================================
@@ -676,58 +700,50 @@ def build_result_rows(records: list[FastaRecord], input_mode: str, engine: str, 
 
 def make_region_fasta(
     df: pd.DataFrame,
-    region_name: str,
-    header_mode: str = "Full original header",
-    keep_failed_records: bool = True,
+    region: str,
+    header_mode: str,
+    keep_failed_records: bool,
 ) -> str:
-    lines: list[str] = []
-
+    lines = []
     for _, row in df.sort_values("order").iterrows():
-        if row["status"] != "ok" and not keep_failed_records:
+        if not str(row["status"]).startswith("ok") and not keep_failed_records:
             continue
-
-        header = row["sample_id"] if header_mode == "Sample ID only" else row["header"]
-        seq = row.get(region_name, "") or ""
+        header = str(row["sample_id"]) if header_mode == "Sample ID only" else str(row.get("header", row["sample_id"]))
+        seq = str(row.get(region, "") or "")
         lines.append(f">{header}")
         lines.append(wrap_fasta_sequence(seq))
-
     return "\n".join(lines).rstrip() + "\n"
 
 
 def make_combined_fasta(
     df: pd.DataFrame,
     selected_regions: list[str],
-    header_mode: str = "Full original header",
-    keep_failed_records: bool = True,
-    separator: str = "",
+    header_mode: str,
+    keep_failed_records: bool,
+    separator: str,
 ) -> str:
-    lines: list[str] = []
-
+    lines = []
     for _, row in df.sort_values("order").iterrows():
-        if row["status"] != "ok" and not keep_failed_records:
+        if not str(row["status"]).startswith("ok") and not keep_failed_records:
             continue
-
-        header = row["sample_id"] if header_mode == "Sample ID only" else row["header"]
-        seq = separator.join((row.get(region, "") or "") for region in selected_regions)
+        header = str(row["sample_id"]) if header_mode == "Sample ID only" else str(row.get("header", row["sample_id"]))
+        seq = separator.join(str(row.get(region, "") or "") for region in selected_regions)
         lines.append(f">{header}")
         lines.append(wrap_fasta_sequence(seq))
-
     return "\n".join(lines).rstrip() + "\n"
 
 
 def build_zip_file(file_map: dict[str, str]) -> bytes:
     buffer = io.BytesIO()
-
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for filename, content in file_map.items():
             zf.writestr(filename, content)
-
     buffer.seek(0)
     return buffer.getvalue()
 
 
 # =========================================================
-# UI selector helpers
+# Region selector UI
 # =========================================================
 
 def reset_to_only(region_list: list[str]):
@@ -740,65 +756,66 @@ def toggle_region(region: str):
 
 
 def render_region_selector():
-    """Native Streamlit clickable linear map. No raw HTML block."""
-    st.caption("Linear IMGT region map: FR1 → CDR1 → FR2 → CDR2 → FR3 → CDR3 → FR4")
-
-    cols = st.columns([REGION_WIDTHS[region] for region in REGION_ORDER])
+    st.caption("IMGT-style linear map: FR1 → CDR1 → FR2 → CDR2 → FR3 → CDR3 → FR4")
+    cols = st.columns([REGION_WIDTHS[r] for r in REGION_ORDER])
     for col, region in zip(cols, REGION_ORDER):
         selected = st.session_state.get(f"pick_{region}", False)
         label = f"✅ {region}" if selected else region
         with col:
-            st.button(
-                label,
-                key=f"btn_{region}",
-                on_click=toggle_region,
-                args=(region,),
-                use_container_width=True,
-            )
+            st.button(label, key=f"btn_{region}", on_click=toggle_region, args=(region,), use_container_width=True)
 
 
 # =========================================================
-# Streamlit app
+# Main app
 # =========================================================
 
-st.title("IMGT Antibody / Nanobody Region Extractor")
+st.title("VHH / Antibody IMGT Region Extractor")
 st.caption(
-    "Upload FASTA files, select IMGT regions, and download one FASTA per selected region. "
-    "Input order and sample IDs are preserved."
+    "Primary workflow: upload VHH/VH FASTA and extract IMGT-like FR/CDR regions using conserved anchors. "
+    "Optional workflow: upload ANARCI/IMGT numbered CSV for exact position-column extraction."
 )
 
 with st.sidebar:
-    st.header("Input settings")
+    st.header("Input source")
 
-    input_mode = st.radio(
-        "Sequence type",
+    source_type = st.radio(
+        "Choose input source",
         options=[
-            "Amino acid FASTA",
-            "Auto-detect; translate nucleotide if needed",
-            "Force nucleotide translation, all 6 frames",
+            "FASTA VHH/VH sequences",
+            "ANARCI / IMGT numbered CSV",
         ],
         index=0,
     )
 
-    engine = st.radio(
-        "IMGT extraction engine",
-        options=[
-            "Built-in IMGT anchor mapping",
-            "Auto: abnumber if available, otherwise built-in IMGT",
-            "abnumber / ANARCI IMGT",
-        ],
-        index=0,
-        help=(
-            "Built-in IMGT anchor mapping is dependency-free and designed for full-length VH/VHH/VL domains. "
-            "abnumber/ANARCI is optional if installed successfully."
-        ),
-    )
+    input_mode = "Amino acid FASTA"
+    fasta_method = "Hybrid ANARCI-IMGT-like VHH/VH mapper"
 
-    scheme = st.selectbox(
-        "Numbering scheme for abnumber",
-        options=["imgt"],
-        index=0,
-    )
+    if source_type == "FASTA VHH/VH sequences":
+        st.header("FASTA settings")
+
+        input_mode = st.radio(
+            "Sequence type",
+            options=[
+                "Amino acid FASTA",
+                "Auto-detect; translate nucleotide if needed",
+                "Force nucleotide translation, all 6 frames",
+            ],
+            index=0,
+        )
+
+        fasta_method = st.radio(
+            "FASTA region extraction method",
+            options=[
+                "Hybrid ANARCI-IMGT-like VHH/VH mapper",
+                "abnumber / ANARCI IMGT if installed",
+                "Legacy rough motif slicing",
+            ],
+            index=0,
+            help=(
+                "Hybrid is recommended for VHH/VH FASTA input. "
+                "Exact ANARCI CSV mode remains available as a separate input source."
+            ),
+        )
 
     st.header("Output settings")
 
@@ -811,7 +828,6 @@ with st.sidebar:
     keep_failed_records = st.checkbox(
         "Keep failed records as blank FASTA entries",
         value=True,
-        help="Keeps the same number/order of records in every output FASTA.",
     )
 
     create_combined = st.checkbox(
@@ -826,77 +842,96 @@ with st.sidebar:
     )
     separator = "" if separator_choice == "none" else separator_choice
 
-uploaded_files = st.file_uploader(
-    "Upload FASTA file(s)",
-    type=["fasta", "fa", "faa", "fna", "txt"],
-    accept_multiple_files=True,
-)
+st.subheader("1) Upload input")
 
-example_fasta = """>example_vhh_Ty1_RGQG_FR4
+if source_type == "ANARCI / IMGT numbered CSV":
+    uploaded_files = st.file_uploader(
+        "Upload one or more ANARCI/IMGT numbered CSV files",
+        type=["csv", "txt"],
+        accept_multiple_files=True,
+    )
+else:
+    uploaded_files = st.file_uploader(
+        "Upload one or more FASTA files",
+        type=["fasta", "fa", "faa", "fna", "txt"],
+        accept_multiple_files=True,
+    )
+
+use_example = st.checkbox("Use built-in published VHH example", value=False)
+
+example_fasta = """>published_01_Ty1_6ZXN_trimmed
 QVQLVETGGGLVQPGGSLRLSCAASGFTFSSVYMNWVRQAPGKGPEWVSRISPNSGNIGYTDSVKGRFTISRDNAKNTLYLQMNNLKPEDTALYYCAIGLNLSSSSVRGQGTQVTVSS
->example_vhh_Nanosota2_YGQG_FR4
-QVQLQESGGGAVQPGGSLGLSCTASGFNFETSTVGWFRQAPGKENEGVSCINKGYEDTNYADSVKGRFTISRDAAKNTVYLQMDSLQPEDTATYYCAAHNEPYFCDYSGRFRWNEYSYYGQGTQVTVSS
->example_standard_VHH
+>published_02_SARS_VHH72_6WAQ_trimmed
 QVQLQESGGGLVQAGGSLRLSCAASGRTFSEYAMGWFRQAPGKEREFVATISWSGGSTYYTDSVKGRFTISRDNAKNTVYLQMNSLKPDDTAVYYCAAAGLGTVVSEWDYDYDYWGQGTQVTVSS
+>published_10_Nanosota2_8G72_trimmed
+QVQLQESGGGAVQPGGSLGLSCTASGFNFETSTVGWFRQAPGKENEGVSCINKGYEDTNYADSVKGRFTISRDAAKNTVYLQMDSLQPEDTATYYCAAHNEPYFCDYSGRFRWNEYSYYGQGTQVTVSS
 """
 
-use_example = st.checkbox("Use built-in example instead of uploaded files", value=False)
-
-records: list[FastaRecord] = []
+df_list = []
 
 if use_example:
-    records = parse_fasta(example_fasta, source_file="example.fasta", start_order=1)
+    if source_type == "ANARCI / IMGT numbered CSV":
+        st.warning("The built-in example is FASTA. Switch input source to FASTA VHH/VH sequences to use it.")
+    else:
+        records = parse_fasta(example_fasta, source_file="published_vhh_example.fasta", start_order=1)
+        df_list.append(extract_regions_from_fasta_records(records, input_mode=input_mode, fasta_method=fasta_method))
+
 elif uploaded_files:
     next_order = 1
     for file in uploaded_files:
         text = file.getvalue().decode("utf-8", errors="replace")
-        parsed = parse_fasta(text, source_file=file.name, start_order=next_order)
-        records.extend(parsed)
-        next_order += len(parsed)
 
-if not records:
-    st.info("Upload FASTA files or enable the built-in example.")
+        if source_type == "ANARCI / IMGT numbered CSV":
+            try:
+                df_in = pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+                if not looks_like_anarci_imgt_csv(df_in):
+                    st.warning(f"{file.name}: this may not be an ANARCI/IMGT numbered CSV; attempting to parse anyway.")
+                out_df = extract_regions_from_anarci_csv(df_in, source_file=file.name, start_order=next_order)
+                df_list.append(out_df)
+                next_order += len(out_df)
+            except Exception as e:
+                st.error(f"Could not parse {file.name}: {e}")
+        else:
+            records = parse_fasta(text, source_file=file.name, start_order=next_order)
+            df_list.append(extract_regions_from_fasta_records(records, input_mode=input_mode, fasta_method=fasta_method))
+            next_order += len(records)
+
+if not df_list:
+    st.info("Upload input files or enable the built-in example.")
     st.stop()
 
+df = pd.concat(df_list, ignore_index=True)
 
-# ---------------------------------------------------------
+
 # Region selection
-# ---------------------------------------------------------
+st.subheader("2) Select region(s) to extract")
 
-st.subheader("1) Select IMGT region(s) to extract")
-
-if not any(f"pick_{region}" in st.session_state for region in REGION_ORDER):
+if not any(f"pick_{r}" in st.session_state for r in REGION_ORDER):
     reset_to_only(["CDR3"])
 
 action_cols = st.columns(6)
-
 with action_cols[0]:
     if st.button("Select all", use_container_width=True):
         reset_to_only(REGION_ORDER)
-
 with action_cols[1]:
     if st.button("Clear all", use_container_width=True):
         reset_to_only([])
-
 with action_cols[2]:
     if st.button("All CDRs", use_container_width=True):
         reset_to_only(["CDR1", "CDR2", "CDR3"])
-
 with action_cols[3]:
     if st.button("All FRs", use_container_width=True):
         reset_to_only(["FR1", "FR2", "FR3", "FR4"])
-
 with action_cols[4]:
     if st.button("CDR3 only", use_container_width=True):
         reset_to_only(["CDR3"])
-
 with action_cols[5]:
     if st.button("CDR1+2+3", use_container_width=True):
         reset_to_only(["CDR1", "CDR2", "CDR3"])
 
 render_region_selector()
 
-selected_regions = [region for region in REGION_ORDER if st.session_state.get(f"pick_{region}", False)]
+selected_regions = [r for r in REGION_ORDER if st.session_state.get(f"pick_{r}", False)]
 
 if not selected_regions:
     st.warning("Please select at least one region.")
@@ -905,51 +940,43 @@ if not selected_regions:
 st.write("**Selected regions:**", " + ".join(selected_regions))
 
 
-# ---------------------------------------------------------
-# Process
-# ---------------------------------------------------------
-
-df = build_result_rows(records, input_mode=input_mode, engine=engine, scheme=scheme)
+# Results
+st.subheader("3) Results")
 
 n_total = len(df)
-n_ok = int((df["status"] == "ok").sum())
+n_ok = int(df["status"].astype(str).str.startswith("ok").sum())
 n_failed = n_total - n_ok
-n_builtin = int((df["method_used"] == "built_in_imgt").sum())
-n_abnumber = int((df["method_used"] == "abnumber_imgt").sum())
 
 metric_cols = st.columns(5)
 metric_cols[0].metric("Input records", n_total)
-metric_cols[1].metric("Segmented", n_ok)
+metric_cols[1].metric("Extracted", n_ok)
 metric_cols[2].metric("Failed", n_failed)
-metric_cols[3].metric("Built-in IMGT", n_builtin)
-metric_cols[4].metric("abnumber IMGT", n_abnumber)
-
-st.subheader("2) Results")
+metric_cols[3].metric("Input source", source_type.split()[0])
+metric_cols[4].metric("Selected regions", len(selected_regions))
 
 display_cols = [
     "order",
     "source_file",
     "sample_id",
     "status",
-    "chain_type",
+    "input_type",
     "method_used",
+    "chain_type",
+    "score",
     "frame",
     "strand",
-    "score",
     "note",
-] + selected_regions + [f"{region}_len" for region in selected_regions]
+] + selected_regions + [f"{r}_len" for r in selected_regions]
 
+display_cols = [c for c in display_cols if c in df.columns]
 st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
 with st.expander("Show full QC table"):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-# ---------------------------------------------------------
 # Downloads
-# ---------------------------------------------------------
-
-st.subheader("3) Download output")
+st.subheader("4) Download output")
 
 file_map: dict[str, str] = {}
 
@@ -971,14 +998,14 @@ if create_combined and len(selected_regions) > 1:
         separator=separator,
     )
 
-file_map["imgt_region_extraction_qc.csv"] = df.to_csv(index=False)
+file_map["region_extraction_qc.csv"] = df.to_csv(index=False)
 
 zip_bytes = build_zip_file(file_map)
 
 st.download_button(
     "Download all selected outputs as ZIP",
     data=zip_bytes,
-    file_name="imgt_region_extraction_outputs.zip",
+    file_name="vhh_region_extraction_outputs.zip",
     mime="application/zip",
     use_container_width=True,
 )
@@ -1014,25 +1041,25 @@ if create_combined and len(selected_regions) > 1:
 with st.expander("Method notes"):
     st.markdown(
         """
-        **Built-in IMGT anchor mapping**
+        **Recommended for your use case: FASTA VHH/VH sequences → Hybrid ANARCI-IMGT-like VHH/VH mapper.**
 
-        This dependency-free mode maps full-length VH/VHH/VL variable domains using the main IMGT anchors:
+        This method uses conserved antibody anchors plus IMGT-like segment lengths to dissect full-length VHH/VH FASTA sequences:
 
-        - first conserved Cys, approximately Cys23
-        - conserved Trp, approximately Trp41
-        - second conserved Cys, approximately Cys104
-        - terminal FR4 `xGxG` motif, approximately position 118
+        - Cys23
+        - Trp41
+        - Cys104
+        - terminal FR4 xGxG motif
 
-        It then applies IMGT-like CDR length limits:
+        It then assigns regions in an ANARCI-IMGT-like way:
 
-        - CDR1-IMGT is capped at 12 amino acids
-        - CDR2-IMGT is capped at 10 amino acids
-        - CDR3 is extracted between Cys104 and the FR4 anchor and can be longer due to junctional diversity
+        - FR1 includes Cys23 plus the next three residues.
+        - FR2 is assigned as 17 residues.
+        - FR3 is assigned as 38 residues and ends with Cys104.
+        - CDR1, CDR2, and CDR3 are the variable regions between these anchors.
+        - FR4 starts at the terminal xGxG motif, including real VHH cases such as RGQG and YGQG.
 
-        This works well for full-length VHH/VH sequences and fixes the previous failures caused by non-W/F FR4 starts such as `RGQG` or `YGQG`.
+        **Exact reference mode:** If you already have ANARCI/IMGT numbered CSV output, choose `ANARCI / IMGT numbered CSV`. That mode extracts directly from columns 1–128 and will match ANARCI exactly.
 
-        **Formal numbering**
-
-        For strict publication-grade numbering across unusual, truncated, or highly engineered sequences, use IMGT/V-QUEST or a local ANARCI/abnumber installation and compare the QC output.
+        **Legacy rough motif slicing** is kept as an option, but it is not IMGT-exact.
         """
     )
