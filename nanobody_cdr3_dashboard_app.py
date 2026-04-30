@@ -1,50 +1,38 @@
-"""
-Streamlit dashboard: extract nanobody/VHH CDR3 regions from FASTA files.
-
-Input
------
-- One or more FASTA files.
-- Each file may contain one or many sequences.
-- Sequences are expected to be amino-acid nanobody/VHH variable-domain sequences.
-- Optional auto-translation mode can handle nucleotide coding sequences and tries all 6 frames.
-
-Output
-------
-- FASTA containing extracted CDR3 sequences in the same record order.
-- Headers/sample IDs are preserved by default.
-- QC table with extraction status, CDR3 length, motif positions, frame, and confidence.
-
-Run
----
-    pip install streamlit pandas
-    streamlit run nanobody_cdr3_dashboard_app.py
-
-Notes
------
-This app uses a motif-based heuristic:
-- CDR3 starts after the conserved heavy-chain/VHH Cys anchor, often within a YYC/YxC motif.
-- CDR3 ends before the downstream J-region F/W-G-x-G motif, often WGQG.
-
-For regulatory, publication, or final repertoire annotation, validate against a numbering tool
-such as ANARCI, IgBLAST, or an in-house IMGT-numbering workflow.
-"""
-
 from __future__ import annotations
 
 import io
 import re
 import textwrap
+import zipfile
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
+try:
+    from abnumber import Chain
+    ABNUMBER_AVAILABLE = True
+except Exception:
+    Chain = None
+    ABNUMBER_AVAILABLE = False
 
-# -----------------------------
-# Data models
-# -----------------------------
 
+# =========================================================
+# Config
+# =========================================================
+st.set_page_config(page_title="Antibody / Nanobody Region Extractor", page_icon="🧬", layout="wide")
+
+REGION_ORDER = ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
+REGION_WIDTHS = {"FR1": 3, "CDR1": 2, "FR2": 3, "CDR2": 2, "FR3": 4, "CDR3": 2, "FR4": 2}
+
+VALID_AA_LETTERS = set("ACDEFGHIKLMNPQRSTVWYBXZJUO*")
+NUCLEOTIDE_LETTERS = set("ACGTUNRYSWKMBDHV")
+
+
+# =========================================================
+# Data model
+# =========================================================
 @dataclass
 class FastaRecord:
     order: int
@@ -57,38 +45,10 @@ class FastaRecord:
         return self.header.split()[0] if self.header.strip() else f"record_{self.order}"
 
 
-@dataclass
-class ExtractionResult:
-    order: int
-    source_file: str
-    sample_id: str
-    header: str
-    input_length: int
-    aa_sequence_used: str
-    aa_length_used: int
-    cdr3: str
-    cdr3_length: int
-    status: str
-    confidence: str
-    reason: str
-    c_anchor_1based: Optional[int]
-    j_anchor_1based: Optional[int]
-    j_motif: str
-    frame: str
-    strand: str
-    score: float
-
-
-# -----------------------------
-# FASTA parsing and formatting
-# -----------------------------
-
-VALID_AA_LETTERS = set("ACDEFGHIKLMNPQRSTVWYBXZJUO*")
-NUCLEOTIDE_LETTERS = set("ACGTUNRYSWKMBDHV")
-
-
+# =========================================================
+# FASTA utilities
+# =========================================================
 def parse_fasta(text: str, source_file: str, start_order: int = 1) -> list[FastaRecord]:
-    """Parse FASTA text while preserving full headers and record order."""
     records: list[FastaRecord] = []
     header: Optional[str] = None
     seq_lines: list[str] = []
@@ -113,7 +73,6 @@ def parse_fasta(text: str, source_file: str, start_order: int = 1) -> list[Fasta
             seq_lines = []
         else:
             if header is None:
-                # Graceful fallback for non-FASTA text: create one synthetic record.
                 header = source_file.rsplit(".", 1)[0]
             seq_lines.append(line)
 
@@ -130,12 +89,26 @@ def parse_fasta(text: str, source_file: str, start_order: int = 1) -> list[Fasta
     return records
 
 
-def clean_sequence(seq: str, keep_stop: bool = True) -> str:
-    """Remove whitespace, numbers, FASTA gaps, and unusual symbols."""
+def clean_sequence(seq: str, keep_stop: bool = True, keep_gap: bool = True) -> str:
     seq = seq.upper().replace(" ", "").replace("\t", "")
-    seq = re.sub(r"[\r\n0-9\-_.]", "", seq)
-    allowed = VALID_AA_LETTERS if keep_stop else (VALID_AA_LETTERS - {"*"})
-    return "".join(ch for ch in seq if ch in allowed or ch in NUCLEOTIDE_LETTERS)
+    seq = re.sub(r"[\r\n0-9_.]", "", seq)
+
+    allowed = set(VALID_AA_LETTERS)
+    if not keep_stop:
+        allowed.discard("*")
+    if keep_gap:
+        allowed.add("-")
+
+    # Keep nucleotide letters too so auto-detect can still work before translation.
+    allowed = allowed | NUCLEOTIDE_LETTERS
+    return "".join(ch for ch in seq if ch in allowed)
+
+
+def clean_aa_for_numbering(seq: str) -> str:
+    seq = clean_sequence(seq, keep_stop=False, keep_gap=False)
+    seq = seq.replace("-", "")
+    seq = re.sub(r"[^A-Z]", "", seq)
+    return seq
 
 
 def wrap_fasta_sequence(seq: str, width: int = 80) -> str:
@@ -144,56 +117,22 @@ def wrap_fasta_sequence(seq: str, width: int = 80) -> str:
     return "\n".join(textwrap.wrap(seq, width=width))
 
 
-def make_output_fasta(
-    results: list[ExtractionResult],
-    keep_failed_records: bool = True,
-    header_mode: str = "Full original header",
-    add_status_to_failed_headers: bool = False,
-) -> str:
-    """Create CDR3 FASTA in input order."""
-    lines: list[str] = []
-
-    for r in sorted(results, key=lambda x: x.order):
-        if r.status != "ok" and not keep_failed_records:
-            continue
-
-        if header_mode == "Sample ID only":
-            header = r.sample_id
-        else:
-            header = r.header
-
-        # Preserve requested header/sample ID. Optional suffix only for failed records.
-        if r.status != "ok" and add_status_to_failed_headers:
-            header = f"{header} | CDR3_NOT_FOUND | {r.reason}"
-
-        lines.append(f">{header}")
-        lines.append(wrap_fasta_sequence(r.cdr3))
-
-    return "\n".join(lines).rstrip() + "\n"
-
-
-# -----------------------------
-# Nucleotide translation utilities
-# -----------------------------
-
+# =========================================================
+# Nucleotide translation helpers
+# =========================================================
 CODON_TABLE = {
-    # Phenylalanine / Leucine
     "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
     "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
-    # Isoleucine / Methionine / Valine
     "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
     "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
-    # Serine / Proline / Threonine / Alanine
     "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
     "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
     "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
     "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
-    # Tyrosine / Histidine / Glutamine / Asparagine / Lysine / Aspartate / Glutamate
     "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
     "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
     "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
     "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
-    # Cysteine / Tryptophan / Arginine / Glycine
     "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
     "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
     "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
@@ -210,7 +149,10 @@ def looks_like_nucleotide(seq: str) -> bool:
 
 
 def reverse_complement(seq: str) -> str:
-    table = str.maketrans("ACGTUNRYSWKMBDHVacgtunryswkmbdhv", "TGCAANRYSWMKVHDBtgcaanryswmkvhdb")
+    table = str.maketrans(
+        "ACGTUNRYSWKMBDHVacgtunryswkmbdhv",
+        "TGCAANRYSWMKVHDBtgcaanryswkmbdhv".upper(),
+    )
     return seq.translate(table)[::-1].upper().replace("U", "T")
 
 
@@ -219,278 +161,337 @@ def translate_nt(seq: str, frame: int = 0) -> str:
     seq = re.sub(r"[^ACGT]", "N", seq)
     aa: list[str] = []
     for i in range(frame, len(seq) - 2, 3):
-        codon = seq[i : i + 3]
+        codon = seq[i:i + 3]
         aa.append(CODON_TABLE.get(codon, "X"))
     return "".join(aa)
 
 
 def candidate_aa_sequences(raw_seq: str, mode: str) -> list[tuple[str, str, str]]:
-    """Return candidate AA sequences as (aa_seq, frame_label, strand_label)."""
     cleaned = clean_sequence(raw_seq)
 
     if mode == "Amino acid FASTA":
-        return [(cleaned.replace("*", ""), "input", "+")]
+        return [(cleaned.replace("*", "").replace("-", ""), "input", "+")]
 
     nt_only = re.sub(r"[^A-Za-z]", "", raw_seq).upper().replace("U", "T")
     nt_only = re.sub(r"[^ACGTN]", "N", nt_only)
 
     if mode == "Auto-detect; translate nucleotide if needed" and not looks_like_nucleotide(cleaned):
-        return [(cleaned.replace("*", ""), "input", "+")]
+        return [(cleaned.replace("*", "").replace("-", ""), "input", "+")]
 
     candidates: list[tuple[str, str, str]] = []
     for strand_label, nt_seq in [("+", nt_only), ("-", reverse_complement(nt_only))]:
         for frame in range(3):
-            aa = translate_nt(nt_seq, frame=frame)
-            # Keep internal X but remove stops because the VHH domain should be continuous.
-            aa = aa.replace("*", "")
+            aa = translate_nt(nt_seq, frame=frame).replace("*", "")
             candidates.append((aa, f"frame_{frame + 1}", strand_label))
     return candidates
 
 
-# -----------------------------
-# CDR3 extraction logic
-# -----------------------------
+# =========================================================
+# Region extraction
+# =========================================================
+def get_regions_with_abnumber(aa_seq: str, scheme: str = "imgt") -> tuple[dict[str, str], str]:
+    if not ABNUMBER_AVAILABLE or Chain is None:
+        raise RuntimeError("abnumber is not installed or failed to import.")
 
-@dataclass
-class CDR3Candidate:
-    cdr3: str
-    c_anchor: int
-    j_anchor: int
-    j_motif: str
-    score: float
-    confidence: str
-    reason: str
+    aa_seq = clean_aa_for_numbering(aa_seq)
+    chain = Chain(aa_seq, scheme=scheme)
 
+    region_map = {
+        "FR1": getattr(chain, "fr1_seq", "") or "",
+        "CDR1": getattr(chain, "cdr1_seq", "") or "",
+        "FR2": getattr(chain, "fr2_seq", "") or "",
+        "CDR2": getattr(chain, "cdr2_seq", "") or "",
+        "FR3": getattr(chain, "fr3_seq", "") or "",
+        "CDR3": getattr(chain, "cdr3_seq", "") or "",
+        "FR4": getattr(chain, "fr4_seq", "") or "",
+    }
 
-J_ANCHOR_PATTERNS = [
-    (re.compile(r"[WF]GQG"), "strong_WF_GQG", 30),
-    (re.compile(r"[WF]G.G"), "medium_WF_GxG", 22),
-    (re.compile(r"[WF]G.."), "weak_WF_Gxx", 10),
-]
-
-
-def score_c_anchor_context(seq: str, c_pos: int) -> tuple[float, list[str]]:
-    """Score whether a Cys looks like the conserved pre-CDR3 Cys anchor."""
-    score = 0.0
-    notes: list[str] = []
-    left5 = seq[max(0, c_pos - 5) : c_pos + 1]
-    left3 = seq[max(0, c_pos - 2) : c_pos + 1]
-
-    if re.search(r"YYC$", left5):
-        score += 35
-        notes.append("YYC C-anchor")
-    elif re.search(r"[YFH][YFH]C$", left5):
-        score += 26
-        notes.append("aromatic-aromatic-C anchor")
-    elif re.search(r"[YFHW][A-Z]C$", left5):
-        score += 18
-        notes.append("Y/F/W-x-C anchor")
-    elif left3.endswith("C"):
-        score += 6
-        notes.append("C anchor without strong YYC context")
-
-    # Full VHH variable domains usually place this anchor around aa 85-115;
-    # keep this soft because users may upload partial or fusion sequences.
-    if 80 <= c_pos <= 115:
-        score += 12
-        notes.append("C position typical for VHH variable domain")
-    elif 60 <= c_pos <= 140:
-        score += 6
-        notes.append("C position plausible")
-
-    return score, notes
+    chain_type = getattr(chain, "chain_type", "unknown")
+    return region_map, chain_type
 
 
-def confidence_from_score(score: float) -> str:
-    if score >= 92:
-        return "high"
-    if score >= 68:
-        return "medium"
-    if score >= 45:
-        return "low"
-    return "very_low"
+def get_regions_with_fallback_heuristic(aa_seq: str) -> tuple[dict[str, str], str]:
+    """
+    Dependency-free approximate segmentation.
+
+    This is less accurate than numbering, but useful if abnumber/ANARCI is unavailable.
+    It tries common VH/VHH boundaries:
+    - CDR1 around after first Cys and before W of FR2
+    - CDR2 after conserved W region and before FR3 YY/FTIS motif
+    - CDR3 between YYC/YxC and WGQG/FGQG/WGxG anchor
+
+    For serious annotation, use abnumber mode.
+    """
+    seq = clean_aa_for_numbering(aa_seq)
+    regions = {r: "" for r in REGION_ORDER}
+
+    # CDR3: best supported heuristic.
+    cdr3_match = None
+    for m in re.finditer(r"C([A-Z]{3,80}?)([WF]G.Q|[WF]G.G|[WF]G..)", seq):
+        c_pos = m.start()
+        j_pos = m.start(2)
+        if 70 <= c_pos <= 120 and 5 <= len(m.group(1)) <= 60:
+            # Prefer YYC/YxC context and plausible CDR3 length.
+            context = seq[max(0, c_pos - 2):c_pos + 1]
+            score = 0
+            if re.search(r"[YFH][YFH]C", context):
+                score += 10
+            score += min(len(m.group(1)), 20)
+            candidate = (score, c_pos, j_pos, m.group(1))
+            if cdr3_match is None or candidate > cdr3_match:
+                cdr3_match = candidate
+
+    if cdr3_match:
+        _, c_pos, j_pos, cdr3 = cdr3_match
+        regions["CDR3"] = cdr3
+        regions["FR4"] = seq[j_pos:]
+
+        # Split upstream approximately.
+        upstream = seq[:c_pos + 1]
+        regions["FR3"] = upstream[-38:] if len(upstream) >= 38 else upstream
+        before_fr3 = upstream[:-len(regions["FR3"])] if regions["FR3"] else upstream
+    else:
+        before_fr3 = seq
+        regions["FR3"] = ""
+        regions["FR4"] = ""
+
+    # Approximate CDR1 using first conserved Cys and W anchor.
+    c1 = seq.find("C")
+    w_after_c1 = seq.find("W", c1 + 1) if c1 >= 0 else -1
+    if c1 >= 0 and w_after_c1 > c1:
+        regions["FR1"] = seq[:c1 + 1]
+        regions["CDR1"] = seq[c1 + 1:w_after_c1]
+        # FR2/CDR2/FR3 approximation from remaining pre-FR3 sequence.
+        mid = before_fr3[w_after_c1:] if w_after_c1 < len(before_fr3) else ""
+        # CDR2 often starts after a short FR2 segment and is ~7-20 aa.
+        if len(mid) > 25:
+            regions["FR2"] = mid[:15]
+            regions["CDR2"] = mid[15:30]
+            if not regions["FR3"]:
+                regions["FR3"] = mid[30:]
+        else:
+            regions["FR2"] = mid
+    else:
+        # Last-resort chunks, only so the app returns something readable.
+        regions["FR1"] = seq[:25]
+        regions["CDR1"] = seq[25:35]
+        regions["FR2"] = seq[35:50]
+        regions["CDR2"] = seq[50:65]
+        if not regions["FR3"]:
+            regions["FR3"] = seq[65:100]
+        if not regions["CDR3"]:
+            regions["CDR3"] = ""
+        if not regions["FR4"]:
+            regions["FR4"] = seq[100:]
+
+    return regions, "unknown_fallback"
 
 
-def extract_cdr3_from_aa(
-    aa_seq: str,
-    min_len: int = 5,
-    max_len: int = 60,
-    require_strong_c_anchor: bool = False,
-) -> Optional[CDR3Candidate]:
-    """Extract CDR3 from an amino-acid sequence using Cys and F/W-G-x-G anchors."""
-    seq = clean_sequence(aa_seq, keep_stop=False)
-    if len(seq) < 50:
-        return None
+def get_regions(aa_seq: str, scheme: str, method: str) -> tuple[dict[str, str], str, str]:
+    """
+    Return region_map, chain_type, method_used.
+    """
+    if method == "abnumber / IMGT numbering":
+        region_map, chain_type = get_regions_with_abnumber(aa_seq, scheme=scheme)
+        return region_map, chain_type, "abnumber"
 
-    candidates: list[CDR3Candidate] = []
+    if method == "fallback heuristic only":
+        region_map, chain_type = get_regions_with_fallback_heuristic(aa_seq)
+        return region_map, chain_type, "fallback_heuristic"
 
-    for pattern, j_label, j_score in J_ANCHOR_PATTERNS:
-        for j_match in pattern.finditer(seq):
-            j_start = j_match.start()
-            j_motif = j_match.group(0)
-
-            # Avoid very early false-positive WG motifs.
-            if j_start < 45:
-                continue
-
-            c_positions = [m.start() for m in re.finditer("C", seq[:j_start])]
-            for c_pos in c_positions:
-                cdr3 = seq[c_pos + 1 : j_start]
-                cdr3_len = len(cdr3)
-                if cdr3_len < min_len or cdr3_len > max_len:
-                    continue
-
-                anchor_score, c_notes = score_c_anchor_context(seq, c_pos)
-                if require_strong_c_anchor and anchor_score < 18:
-                    continue
-
-                # Length prior: nanobody CDR3s are often longer than conventional VH,
-                # but use a broad range to avoid rejecting valid engineered clones.
-                if 8 <= cdr3_len <= 30:
-                    len_score = 20
-                elif 5 <= cdr3_len <= 45:
-                    len_score = 14
-                else:
-                    len_score = 8
-
-                # Prefer C anchors not immediately next to the J motif; those are often Cys within CDR3.
-                distance_score = min(8, cdr3_len / 4)
-
-                # Penalize suspicious sequences that include stop or too many unknowns.
-                x_fraction = cdr3.count("X") / max(1, cdr3_len)
-                x_penalty = 25 * x_fraction
-
-                score = anchor_score + j_score + len_score + distance_score - x_penalty
-                reason = "; ".join(c_notes + [j_label, f"CDR3 length={cdr3_len}"])
-                candidates.append(
-                    CDR3Candidate(
-                        cdr3=cdr3,
-                        c_anchor=c_pos,
-                        j_anchor=j_start,
-                        j_motif=j_motif,
-                        score=score,
-                        confidence=confidence_from_score(score),
-                        reason=reason,
-                    )
-                )
-
-    if not candidates:
-        return None
-
-    # Highest score wins. Tie-breaker: choose the upstream C anchor, which reduces the chance
-    # of accidentally treating an internal CDR3 cysteine as the conserved C anchor.
-    candidates.sort(key=lambda c: (c.score, -c.c_anchor), reverse=True)
-    return candidates[0]
+    # Auto mode.
+    try:
+        region_map, chain_type = get_regions_with_abnumber(aa_seq, scheme=scheme)
+        return region_map, chain_type, "abnumber"
+    except Exception:
+        region_map, chain_type = get_regions_with_fallback_heuristic(aa_seq)
+        return region_map, chain_type, "fallback_heuristic"
 
 
-def extract_record(
-    record: FastaRecord,
-    input_mode: str,
-    min_len: int,
-    max_len: int,
-    require_strong_c_anchor: bool,
-) -> ExtractionResult:
-    candidates = candidate_aa_sequences(record.sequence, input_mode)
+def get_best_numbered_candidate(raw_seq: str, input_mode: str, scheme: str, method: str):
+    candidates = candidate_aa_sequences(raw_seq, input_mode)
+    best = None
+    last_error = ""
 
-    best: Optional[tuple[CDR3Candidate, str, str, str]] = None
     for aa_seq, frame_label, strand_label in candidates:
-        c = extract_cdr3_from_aa(
-            aa_seq=aa_seq,
-            min_len=min_len,
-            max_len=max_len,
-            require_strong_c_anchor=require_strong_c_anchor,
-        )
-        if c is None:
+        aa_clean = clean_aa_for_numbering(aa_seq)
+        if len(aa_clean) < 45:
             continue
-        if best is None or c.score > best[0].score:
-            best = (c, aa_seq, frame_label, strand_label)
 
-    input_len = len(clean_sequence(record.sequence))
+        try:
+            region_map, chain_type, method_used = get_regions(aa_clean, scheme=scheme, method=method)
+            non_empty_regions = sum(1 for v in region_map.values() if v)
+            cdr_score = sum(len(region_map.get(r, "")) for r in ["CDR1", "CDR2", "CDR3"])
+            score = non_empty_regions * 100 + cdr_score + len(region_map.get("FR3", ""))
 
-    if best is None:
-        first_aa = candidates[0][0] if candidates else ""
-        return ExtractionResult(
-            order=record.order,
-            source_file=record.source_file,
-            sample_id=record.sample_id,
-            header=record.header,
-            input_length=input_len,
-            aa_sequence_used=first_aa,
-            aa_length_used=len(first_aa),
-            cdr3="",
-            cdr3_length=0,
-            status="not_found",
-            confidence="none",
-            reason="No plausible Cys-to-F/W-G-x-G CDR3 boundary found under current length/settings.",
-            c_anchor_1based=None,
-            j_anchor_1based=None,
-            j_motif="",
-            frame="",
-            strand="",
-            score=0.0,
+            if best is None or score > best["score"]:
+                best = {
+                    "aa_sequence_used": aa_clean,
+                    "frame": frame_label,
+                    "strand": strand_label,
+                    "chain_type": chain_type,
+                    "region_map": region_map,
+                    "method_used": method_used,
+                    "score": score,
+                }
+        except Exception as e:
+            last_error = str(e)
+
+    return best, last_error
+
+
+def build_result_rows(records: list[FastaRecord], input_mode: str, scheme: str, method: str) -> pd.DataFrame:
+    rows = []
+    for r in records:
+        best, last_error = get_best_numbered_candidate(
+            r.sequence,
+            input_mode=input_mode,
+            scheme=scheme,
+            method=method,
         )
 
-    c, aa_seq, frame_label, strand_label = best
-    return ExtractionResult(
-        order=record.order,
-        source_file=record.source_file,
-        sample_id=record.sample_id,
-        header=record.header,
-        input_length=input_len,
-        aa_sequence_used=aa_seq,
-        aa_length_used=len(aa_seq),
-        cdr3=c.cdr3,
-        cdr3_length=len(c.cdr3),
-        status="ok",
-        confidence=c.confidence,
-        reason=c.reason,
-        c_anchor_1based=c.c_anchor + 1,
-        j_anchor_1based=c.j_anchor + 1,
-        j_motif=c.j_motif,
-        frame=frame_label,
-        strand=strand_label,
-        score=round(c.score, 2),
-    )
+        row = {
+            "order": r.order,
+            "source_file": r.source_file,
+            "sample_id": r.sample_id,
+            "header": r.header,
+            "input_length": len(clean_sequence(r.sequence)),
+            "status": "ok" if best else "not_found",
+            "reason": "" if best else f"Could not segment sequence. {last_error}",
+            "frame": best["frame"] if best else "",
+            "strand": best["strand"] if best else "",
+            "chain_type": best["chain_type"] if best else "",
+            "method_used": best["method_used"] if best else "",
+            "score": best["score"] if best else 0,
+        }
+
+        for region in REGION_ORDER:
+            row[region] = best["region_map"].get(region, "") if best else ""
+            row[f"{region}_len"] = len(row[region])
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
-def results_to_dataframe(results: list[ExtractionResult]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "order": r.order,
-                "source_file": r.source_file,
-                "sample_id": r.sample_id,
-                "status": r.status,
-                "confidence": r.confidence,
-                "cdr3": r.cdr3,
-                "cdr3_length": r.cdr3_length,
-                "c_anchor_1based": r.c_anchor_1based,
-                "j_anchor_1based": r.j_anchor_1based,
-                "j_motif": r.j_motif,
-                "frame": r.frame,
-                "strand": r.strand,
-                "score": r.score,
-                "reason": r.reason,
-                "input_length": r.input_length,
-                "aa_length_used": r.aa_length_used,
-                "header": r.header,
-            }
-            for r in sorted(results, key=lambda x: x.order)
-        ]
-    )
+# =========================================================
+# FASTA output
+# =========================================================
+def make_region_fasta(
+    df: pd.DataFrame,
+    region_name: str,
+    header_mode: str = "Full original header",
+    keep_failed_records: bool = True,
+) -> str:
+    lines = []
+    for _, row in df.sort_values("order").iterrows():
+        if row["status"] != "ok" and not keep_failed_records:
+            continue
+        header = row["sample_id"] if header_mode == "Sample ID only" else row["header"]
+        seq = row.get(region_name, "") or ""
+        lines.append(f">{header}")
+        lines.append(wrap_fasta_sequence(seq))
+    return "\n".join(lines).rstrip() + "\n"
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
+def make_combined_fasta(
+    df: pd.DataFrame,
+    selected_regions: list[str],
+    header_mode: str = "Full original header",
+    keep_failed_records: bool = True,
+    separator: str = "",
+) -> str:
+    lines = []
+    for _, row in df.sort_values("order").iterrows():
+        if row["status"] != "ok" and not keep_failed_records:
+            continue
+        header = row["sample_id"] if header_mode == "Sample ID only" else row["header"]
+        seq_parts = [(row.get(region, "") or "") for region in selected_regions]
+        seq = separator.join(seq_parts)
+        lines.append(f">{header}")
+        lines.append(wrap_fasta_sequence(seq))
+    return "\n".join(lines).rstrip() + "\n"
 
-st.set_page_config(page_title="Nanobody CDR3 Extractor", page_icon="🧬", layout="wide")
 
-st.title("Nanobody/VHH CDR3 Extractor")
+def build_zip_file(file_map: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, content in file_map.items():
+            zf.writestr(filename, content)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# =========================================================
+# UI helpers
+# =========================================================
+def toggle_region(region: str):
+    key = f"pick_{region}"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
+def set_region_group(region_list: list[str], value: bool):
+    for region in REGION_ORDER:
+        if region in region_list:
+            st.session_state[f"pick_{region}"] = value
+
+
+def reset_to_only(region_list: list[str]):
+    for region in REGION_ORDER:
+        st.session_state[f"pick_{region}"] = region in region_list
+
+
+def render_linear_map():
+    segments = []
+    for region in REGION_ORDER:
+        selected = st.session_state.get(f"pick_{region}", False)
+        base_color = "#DCEBFF" if region.startswith("FR") else "#FFE4BF"
+        bg = "#2E7D32" if selected else base_color
+        fg = "white" if selected else "#222222"
+        flex = REGION_WIDTHS[region]
+        segments.append(
+            f"""
+            <div style="
+                flex:{flex};
+                padding:12px 4px;
+                text-align:center;
+                font-weight:700;
+                border-right:1px solid #ffffff;
+                background:{bg};
+                color:{fg};
+            ">{region}</div>
+            """
+        )
+
+    html = f"""
+    <div style="
+        display:flex;
+        border:1px solid #CCCCCC;
+        border-radius:10px;
+        overflow:hidden;
+        margin-bottom:8px;
+    ">
+        {''.join(segments)}
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# =========================================================
+# App
+# =========================================================
+st.title("Antibody / Nanobody Region Extractor")
 st.caption(
-    "Upload FASTA files and extract CDR3 sequences while preserving input order and sample IDs. "
-    "The downloadable FASTA uses the same headers by default."
+    "Upload FASTA files, click VH/VHH regions to select what to extract, "
+    "then download separate FASTA files for each selected region."
 )
+
+if not ABNUMBER_AVAILABLE:
+    st.warning(
+        "abnumber is not available in this environment. "
+        "The app can still run using the fallback heuristic, but region boundaries are approximate. "
+        "For best results, install dependencies from requirements.txt."
+    )
 
 with st.sidebar:
     st.header("Input settings")
@@ -502,34 +503,47 @@ with st.sidebar:
             "Force nucleotide translation, all 6 frames",
         ],
         index=0,
-        help="For clean nanobody protein sequences, use amino acid FASTA. For DNA coding sequences, use auto-detect or force translation.",
     )
 
-    st.header("CDR3 boundary settings")
-    min_len = st.number_input("Minimum CDR3 length", min_value=1, max_value=100, value=5, step=1)
-    max_len = st.number_input("Maximum CDR3 length", min_value=5, max_value=150, value=60, step=1)
-    require_strong_c_anchor = st.checkbox(
-        "Require YYC/YxC-like upstream Cys anchor",
-        value=False,
-        help="Turn this on to reduce false positives, but it may miss unusual or truncated constructs.",
+    method = st.radio(
+        "Region segmentation method",
+        options=[
+            "auto: abnumber first, fallback heuristic if needed",
+            "abnumber / IMGT numbering",
+            "fallback heuristic only",
+        ],
+        index=0,
+        help="abnumber/IMGT is recommended. Fallback is approximate and dependency-free.",
     )
 
-    st.header("FASTA output")
+    scheme = st.selectbox("Numbering scheme", ["imgt"], index=0)
+
+    st.header("Output settings")
     header_mode = st.radio(
         "Output FASTA header",
         options=["Full original header", "Sample ID only"],
         index=0,
     )
+
     keep_failed_records = st.checkbox(
         "Keep failed records as blank FASTA entries",
         value=True,
-        help="Keeps one output FASTA record per input record. Disable this to output only successful CDR3 calls.",
+        help="Keeps the same number/order of records in each output FASTA.",
     )
-    add_status_to_failed_headers = st.checkbox(
-        "Add failure reason to failed FASTA headers",
-        value=False,
-        help="Leave off if you need exactly unchanged FASTA headers/sample IDs.",
+
+    create_combined = st.checkbox(
+        "Also create combined FASTA of all selected regions",
+        value=True,
+        help="If multiple regions are selected, also export one FASTA that concatenates them in region order.",
     )
+
+    separator_choice = st.selectbox(
+        "Combined-region separator",
+        options=["none", "X", "GGGS"],
+        index=0,
+        help="Optional separator inserted between selected regions in the combined FASTA.",
+    )
+    separator = "" if separator_choice == "none" else separator_choice
 
 uploaded_files = st.file_uploader(
     "Upload FASTA file(s)",
@@ -537,7 +551,13 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-example = ">clone_001\nQVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAAVSRGGTTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAREGPYYYGMDYWGQGTQVTVSS\n>clone_002\nQVQLQESGGGLVQAGGSLRLSCAASGFTFSSYWMGWFRQAPGKEREGVAAISSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAKDRSTYDYWGQGTQVTVSS\n"
+example = """>example_vhh_01
+QVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAAVSRGGTTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAREGPYYYGMDYWGQGTQVTVSS
+>example_vh_01
+EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCARDLGGYYFDYWGQGTLVTVSS
+>example_vhh_with_gaps
+QVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAAVSRGGTTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYC---AREGPYYYGMDY---WGQGTQVTVSS
+"""
 
 use_example = st.checkbox("Use built-in example instead of uploaded files", value=False)
 
@@ -553,105 +573,153 @@ elif uploaded_files:
         next_order += len(parsed)
 
 if not records:
-    st.info("Upload FASTA files or enable the built-in example to begin.")
+    st.info("Upload FASTA files or enable the built-in example.")
     st.stop()
 
-if min_len > max_len:
-    st.error("Minimum CDR3 length cannot be greater than maximum CDR3 length.")
+
+# ---------------------------------------------------------
+# Region selection
+# ---------------------------------------------------------
+st.subheader("1) Click region(s) to extract")
+
+action_cols = st.columns(6)
+with action_cols[0]:
+    if st.button("Select all", use_container_width=True):
+        reset_to_only(REGION_ORDER)
+with action_cols[1]:
+    if st.button("Clear all", use_container_width=True):
+        reset_to_only([])
+with action_cols[2]:
+    if st.button("All CDRs", use_container_width=True):
+        reset_to_only(["CDR1", "CDR2", "CDR3"])
+with action_cols[3]:
+    if st.button("All FRs", use_container_width=True):
+        reset_to_only(["FR1", "FR2", "FR3", "FR4"])
+with action_cols[4]:
+    if st.button("CDR3 only", use_container_width=True):
+        reset_to_only(["CDR3"])
+with action_cols[5]:
+    if st.button("CDR1+2+3", use_container_width=True):
+        reset_to_only(["CDR1", "CDR2", "CDR3"])
+
+# Default selection on first load.
+if not any(f"pick_{r}" in st.session_state for r in REGION_ORDER):
+    reset_to_only(["CDR3"])
+
+render_linear_map()
+
+button_cols = st.columns([REGION_WIDTHS[r] for r in REGION_ORDER])
+for col, region in zip(button_cols, REGION_ORDER):
+    selected = st.session_state.get(f"pick_{region}", False)
+    label = f"✅ {region}" if selected else region
+    with col:
+        st.button(label, key=f"btn_{region}", on_click=toggle_region, args=(region,), use_container_width=True)
+
+selected_regions = [r for r in REGION_ORDER if st.session_state.get(f"pick_{r}", False)]
+
+if not selected_regions:
+    st.warning("Please select at least one region.")
     st.stop()
 
-results = [
-    extract_record(
-        record=r,
-        input_mode=input_mode,
-        min_len=int(min_len),
-        max_len=int(max_len),
-        require_strong_c_anchor=require_strong_c_anchor,
-    )
-    for r in records
-]
+st.write("**Selected regions:**", " + ".join(selected_regions))
 
-df = results_to_dataframe(results)
+
+# ---------------------------------------------------------
+# Processing
+# ---------------------------------------------------------
+df = build_result_rows(records, input_mode=input_mode, scheme=scheme, method=method)
 
 n_total = len(df)
 n_ok = int((df["status"] == "ok").sum())
 n_failed = n_total - n_ok
-high_or_medium = int(df["confidence"].isin(["high", "medium"]).sum())
+n_fallback = int((df["method_used"] == "fallback_heuristic").sum())
 
-metric_cols = st.columns(4)
+metric_cols = st.columns(5)
 metric_cols[0].metric("Input records", n_total)
-metric_cols[1].metric("CDR3 found", n_ok)
-metric_cols[2].metric("Not found", n_failed)
-metric_cols[3].metric("High/medium confidence", high_or_medium)
+metric_cols[1].metric("Segmented", n_ok)
+metric_cols[2].metric("Failed", n_failed)
+metric_cols[3].metric("Fallback calls", n_fallback)
+metric_cols[4].metric("Selected regions", len(selected_regions))
 
-if n_ok > 0:
-    length_df = df.loc[df["status"] == "ok", ["cdr3_length"]].copy()
-    st.subheader("CDR3 length distribution")
-    st.bar_chart(length_df["cdr3_length"].value_counts().sort_index())
+st.subheader("2) Results")
+display_cols = [
+    "order", "source_file", "sample_id", "status", "chain_type",
+    "method_used", "frame", "strand", "reason",
+] + selected_regions + [f"{r}_len" for r in selected_regions]
+st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
-st.subheader("Results")
-visible_columns = [
-    "order",
-    "source_file",
-    "sample_id",
-    "status",
-    "confidence",
-    "cdr3",
-    "cdr3_length",
-    "c_anchor_1based",
-    "j_anchor_1based",
-    "j_motif",
-    "frame",
-    "strand",
-    "score",
-    "reason",
-]
-st.dataframe(df[visible_columns], use_container_width=True, hide_index=True)
 
-cdr3_fasta = make_output_fasta(
-    results,
-    keep_failed_records=keep_failed_records,
-    header_mode=header_mode,
-    add_status_to_failed_headers=add_status_to_failed_headers,
+# ---------------------------------------------------------
+# Output files
+# ---------------------------------------------------------
+st.subheader("3) Download output")
+
+file_map: dict[str, str] = {}
+for region in selected_regions:
+    file_map[f"extracted_{region}.fasta"] = make_region_fasta(
+        df,
+        region,
+        header_mode=header_mode,
+        keep_failed_records=keep_failed_records,
+    )
+
+if create_combined and len(selected_regions) > 1:
+    combined_name = "_".join(selected_regions)
+    file_map[f"extracted_{combined_name}.fasta"] = make_combined_fasta(
+        df,
+        selected_regions,
+        header_mode=header_mode,
+        keep_failed_records=keep_failed_records,
+        separator=separator,
+    )
+
+file_map["region_extraction_qc.csv"] = df.to_csv(index=False)
+
+zip_bytes = build_zip_file(file_map)
+
+st.download_button(
+    "Download all selected outputs as ZIP",
+    data=zip_bytes,
+    file_name="region_extraction_outputs.zip",
+    mime="application/zip",
+    use_container_width=True,
 )
 
-csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.markdown("### Individual preview")
+for region in selected_regions:
+    with st.expander(f"Preview {region} FASTA"):
+        st.code(
+            make_region_fasta(
+                df,
+                region,
+                header_mode=header_mode,
+                keep_failed_records=keep_failed_records,
+            )[:10000],
+            language="text",
+        )
 
-st.subheader("Download")
-download_cols = st.columns(2)
-with download_cols[0]:
-    st.download_button(
-        "Download CDR3 FASTA",
-        data=cdr3_fasta.encode("utf-8"),
-        file_name="nanobody_cdr3_extracted.fasta",
-        mime="text/plain",
-        use_container_width=True,
-    )
-with download_cols[1]:
-    st.download_button(
-        "Download QC CSV",
-        data=csv_bytes,
-        file_name="nanobody_cdr3_qc.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+if create_combined and len(selected_regions) > 1:
+    combined_name = "_".join(selected_regions)
+    with st.expander(f"Preview combined FASTA ({combined_name})"):
+        st.code(
+            make_combined_fasta(
+                df,
+                selected_regions,
+                header_mode=header_mode,
+                keep_failed_records=keep_failed_records,
+                separator=separator,
+            )[:10000],
+            language="text",
+        )
 
-with st.expander("Preview output FASTA"):
-    st.code(cdr3_fasta[:10000], language="text")
-
-with st.expander("Method and limitations"):
+with st.expander("Notes / limitations"):
     st.markdown(
         """
-        **Boundary logic used here**
-
-        - The app searches for a plausible downstream J-region motif such as `WGQG`, `FGQG`, or broader `F/W-G-x-G`.
-        - It then searches upstream for a conserved Cys anchor, preferably in a `YYC`, aromatic-aromatic-C, or `Y/F/W-x-C` context.
-        - The extracted CDR3 is the amino-acid sequence **after** the conserved Cys and **before** the F/W anchor.
-
-        **When to be careful**
-
-        - Very short/truncated reads, fusion constructs, sequences with sequencing errors, or unusual engineered frameworks may fail.
-        - CDR3s containing extra cysteines are supported, but ambiguous motif contexts can still cause false calls.
-        - For final annotation, compare against an IMGT-numbering workflow such as ANARCI or IgBLAST.
+        - Recommended mode: **abnumber / IMGT numbering**.
+        - Fallback mode is approximate and mainly useful if `abnumber` cannot be installed.
+        - Gaps (`-`) are removed before numbering/segmentation.
+        - If you upload nucleotide FASTA, the app can translate and try all six frames.
+        - Non-antibody, heavily truncated, or highly engineered sequences may fail or produce uncertain segmentation.
+        - The output ZIP contains one FASTA per selected region plus a QC CSV.
         """
     )
